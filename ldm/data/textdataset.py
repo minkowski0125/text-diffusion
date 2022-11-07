@@ -66,8 +66,10 @@ class QQPDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
+        cond = tokenize(item[0], self.sample_length, return_mask=True)
         data = {
-            "cond_input_ids": np.array(tokenize(item[0], self.sample_length), dtype=np.int64),
+            "cond_input_ids": np.array(cond[0], dtype=np.int64),
+            "cond_attention_mask": np.array(cond[1], dtype=np.int64),
             "input_ids": np.array(tokenize(item[1], self.cond_length), dtype=np.int64)
         }
         return data

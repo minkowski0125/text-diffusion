@@ -9,16 +9,17 @@ model: # add base config
     timesteps: 1000
     first_stage_key: input_ids
     cond_stage_key: cond_input_ids
+    cond_attention_mask: cond_attention_mask
     text_length: 64
-    channels: 768
+    channels: 1024
     cond_stage_trainable: false
     first_stage_trainable: false
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 1
-    uncond_training_ratio: 0.1
+    uncond_training_ratio: 0.5
     # unconditional_guidance_scale: [1.1, 1.5, 2, 5, 10, 50, 100]
-    ckpt_path: logs/2022-10-25T16-03-58_seq2seq/checkpoints/last.ckpt
+    # ckpt_path: logs/2022-10-25T16-03-58_seq2seq/checkpoints/last.ckpt
     use_ema: False
     parameterization: x0
     l_simple_weight: 1.
@@ -36,8 +37,8 @@ model: # add base config
     unet_config:
       target: ldm.modules.diffusionmodules.textmodel.TransformerModel
       params:
-        in_channels: 768
-        out_channels: 768
+        in_channels: 1024
+        out_channels: 1024
         model_channels: 512
         config_name: roberta-base
         cond: cross
@@ -48,9 +49,9 @@ model: # add base config
     first_stage_config:
       target: ldm.models.text_embedder.TextEmbedder
       params:
-        embedding_ckpt_path: /zhangpai21/workspace/zwd/ckpts/roberta-base/1/mp_rank_00_model_states.pt
+        embedding_ckpt_path: /data/qingsong/pretrain/roberta-large/1/mp_rank_00_model_states.pt
         vocab_size: 50265
-        hidden_size: 768
+        hidden_size: 1024
         sample_length: 64
     cond_stage_config: __is_first_stage__
 
@@ -65,13 +66,13 @@ data:
     train:
       target: ldm.data.textdataset.QQPDataset
       params:
-        path: /zhangpai21/workspace/zwd/seq2seq_data/qqp/train.csv
+        path: /data/qingsong/dp/text-diffusion/qqp-dataset/train.csv
         sample_length: 64
         cond_length: 64
     test:
       target: ldm.data.textdataset.QQPDataset
       params:
-        path: /zhangpai21/workspace/zwd/seq2seq_data/qqp/train.csv
+        path: /data/qingsong/dp/text-diffusion/qqp-dataset/train.csv
         sample_length: 64
         cond_length: 64
 
@@ -79,6 +80,8 @@ lightning:
   modelcheckpoint:
     params:
       every_n_train_steps: 10000
+      save_top_k: -1
+      monitor: null
   callbacks:
     text_logger:
       target: main.TextLogger
