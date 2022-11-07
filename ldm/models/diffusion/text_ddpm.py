@@ -436,6 +436,7 @@ class TextDiffusion(DDPM):
                  cond_stage_config,
                  num_timesteps_cond=None,
                  cond_stage_key="class_label",
+                 cond_attention_mask="cond_attention_mask",
                  cond_stage_trainable=False,
                  concat_mode=True,
                  cond_stage_forward=None,
@@ -461,6 +462,7 @@ class TextDiffusion(DDPM):
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
+        self.cond_attention_mask = cond_attention_mask
         self.first_stage_trainable = first_stage_trainable
         try:
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
@@ -476,7 +478,8 @@ class TextDiffusion(DDPM):
         self.clip_denoised = False
         self.uncond_training_ratio = uncond_training_ratio
         self.unconditional_guidance_scale = unconditional_guidance_scale
-        self.null_label = torch.tensor(tokenize(null_label, self.text_length))
+        self.null_label, self.null_mask = tokenize(null_label, self.text_length, return_mask=True)
+        self.null_label, self.null_mask = torch.tensor(self.null_label), torch.tensor(self.null_mask)
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -594,23 +597,28 @@ class TextDiffusion(DDPM):
                     xc = batch
                 else:
                     xc = super().get_input(batch, cond_key).to(self.device)
+                    xc_mask = super().get_input(batch, self.cond_attention_mask).to(self.device)
             else:
                 xc = x
             
             if sampling_uncond and self.uncond_training_ratio > 0.:
                 uncond_idx = (np.random.rand(x.shape[0]) < self.uncond_training_ratio).tolist()
                 null_label = self.null_label.to(self.device)
+                null_mask = self.null_mask.to(self.device)
                 if isinstance(xc, dict):
                     assert isinstance(null_label, dict)
                     for k in xc:
                         assert k in null_label
                         xc[k][uncond_idx] = null_label[k]
+                        xc_mask[k][uncond_idx] = null_mask[k]
                 elif isinstance(xc, list):
                     assert isinstance(null_label, list) and len(null_label) == len(xc)
                     for i in range(len(xc)):
                         xc[i][uncond_idx] = null_label[i]
+                        xc_mask[i][uncond_idx] = null_mask[i]
                 else: # tensor
                     xc[uncond_idx] = null_label
+                    xc_mask[uncond_idx] = null_mask
                 
             if not self.cond_stage_trainable or force_c_encode:
                 if isinstance(xc, dict) or isinstance(xc, list):
@@ -633,7 +641,7 @@ class TextDiffusion(DDPM):
             # if self.use_positional_encodings:
             #     pos_x, pos_y = self.compute_latent_shifts(batch)
             #     c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c]
+        out = [z, (c, xc_mask)]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -667,11 +675,11 @@ class TextDiffusion(DDPM):
         return x
     
     def shared_step(self, batch, **kwargs):
-        x, c, ids = self.get_input(batch, self.first_stage_key, return_x=True, sampling_uncond=True)
-        loss = self(x, ids, c)
+        x, (c, c_mask), ids = self.get_input(batch, self.first_stage_key, return_x=True, sampling_uncond=True)
+        loss = self(x, ids, c, c_mask)
         return loss
     
-    def forward(self, x, ids, c, *args, **kwargs):
+    def forward(self, x, ids, c, c_mask, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
@@ -680,10 +688,10 @@ class TextDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, ids, c, t, *args, **kwargs)
+        return self.p_losses(x, ids, c, c_mask, t, *args, **kwargs)
     
     
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, cond_mask, return_ids=False):
         
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
@@ -691,8 +699,9 @@ class TextDiffusion(DDPM):
         else:
             if not isinstance(cond, list):
                 cond = [cond]
+                cond_mask = [cond_mask]
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
-            cond = {key: cond}
+            cond = {key: cond, 'c_mask': cond_mask}
             
         x_recon = self.model(x_noisy, t, **cond)
         
@@ -719,13 +728,13 @@ class TextDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, ids, cond, t, noise=None):
+    def p_losses(self, x_start, ids, cond, cond_mask, t, noise=None):
         if self.first_stage_trainable:
             x_start = self.get_first_stage_encoding(self.first_stage_model.encode(ids, do_tokenize=False))
         
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy, t, cond, cond_mask)
         
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -757,12 +766,12 @@ class TextDiffusion(DDPM):
         
         return loss, loss_dict
     
-    def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False,
+    def p_mean_variance(self, x, c, c_mask, t, clip_denoised: bool, return_codebook_ids=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None,
-                        unconditional_guidance_scale=1., unconditional_conditioning=None):
+                        unconditional_guidance_scale=1., unconditional_conditioning=None, uc_mask=None):
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             t_in = t
-            model_out = self.apply_model(x, t_in, c, return_ids=return_codebook_ids)
+            model_out = self.apply_model(x, t_in, c, c_mask, return_ids=return_codebook_ids)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
@@ -780,7 +789,8 @@ class TextDiffusion(DDPM):
                                 c[k]])
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
-            model_out_uncond, model_out = self.apply_model(x_in, t_in, c_in).chunk(2)
+                c_mask = torch.cat([uc_mask, c_mask])
+            model_out_uncond, model_out = self.apply_model(x_in, t_in, c_in, c_mask).chunk(2)
             model_out = model_out_uncond + unconditional_guidance_scale * (model_out - model_out_uncond)
         
         if score_corrector is not None:
@@ -806,17 +816,18 @@ class TextDiffusion(DDPM):
             return model_mean, posterior_variance, posterior_log_variance
     
     @torch.no_grad()
-    def p_sample(self, x, c, t, clip_denoised=False, repeat_noise=False,
+    def p_sample(self, x, c, c_mask, t, clip_denoised=False, repeat_noise=False,
                  return_codebook_ids=False, return_x0=False,
                  temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                 unconditional_guidance_scale=1., unconditional_conditioning=None):
+                 unconditional_guidance_scale=1., unconditional_conditioning=None, uc_mask=None):
         b, *_, device = *x.shape, x.device
-        outputs = self.p_mean_variance(x=x, c=c, t=t, clip_denoised=clip_denoised,
+        outputs = self.p_mean_variance(x=x, c=c, c_mask=c_mask, t=t, clip_denoised=clip_denoised,
                                        return_codebook_ids=return_codebook_ids,
                                        return_x0=return_x0,
                                        score_corrector=score_corrector, corrector_kwargs=corrector_kwargs,
                                        unconditional_guidance_scale=unconditional_guidance_scale,
-                                       unconditional_conditioning=unconditional_conditioning)
+                                       unconditional_conditioning=unconditional_conditioning,
+                                       uc_mask=uc_mask)
         if return_codebook_ids:
             raise DeprecationWarning("Support dropped.")
             model_mean, _, model_log_variance, logits = outputs
@@ -894,10 +905,10 @@ class TextDiffusion(DDPM):
         return txt, intermediates
 
     @torch.no_grad()
-    def p_sample_loop(self, cond, shape, return_intermediates=False,
+    def p_sample_loop(self, cond, c_mask, shape, return_intermediates=False,
                       x_T=None, verbose=True, callback=None, timesteps=None,
                       mask=None, x0=None, txt_callback=None, start_T=None, log_every_t=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, uc_mask=None):
 
         if not log_every_t:
             log_every_t = self.log_every_t
@@ -928,10 +939,11 @@ class TextDiffusion(DDPM):
                 tc = self.cond_ids[ts].to(cond.device)
                 cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
             
-            txt = self.p_sample(txt, cond, ts,
+            txt = self.p_sample(txt, cond, c_mask, ts,
                                 clip_denoised=self.clip_denoised,
                                 unconditional_guidance_scale=unconditional_guidance_scale,
-                                unconditional_conditioning=unconditional_conditioning)
+                                unconditional_conditioning=unconditional_conditioning,
+                                uc_mask=uc_mask)
             if mask is not None:
                 txt_orig = self.q_sample(x0, ts)
                 txt = txt_orig * mask + (1. - mask) * txt
@@ -946,10 +958,10 @@ class TextDiffusion(DDPM):
         return txt
     
     @torch.no_grad()
-    def sample(self, cond, batch_size=16, return_intermediates=False, x_T=None,
+    def sample(self, cond, c_mask, batch_size=16, return_intermediates=False, x_T=None,
                verbose=True, timesteps=None,
                mask=None, x0=None, shape=None,
-               unconditional_guidance_scale=1., unconditional_conditioning=None, **kwargs):
+               unconditional_guidance_scale=1., unconditional_conditioning=None, uc_mask=None, **kwargs):
         if shape is None:
             shape = (batch_size, self.channels, self.text_length)
         if cond is not None:
@@ -959,15 +971,17 @@ class TextDiffusion(DDPM):
             else:
                 cond = [c[:batch_size] for c in cond] if isinstance(cond, list) else cond[:batch_size]
         return self.p_sample_loop(cond,
+                                  c_mask,
                                   shape,
                                   return_intermediates=return_intermediates, x_T=x_T,
                                   verbose=verbose, timesteps=timesteps,
                                   mask=mask, x0=x0,
                                   unconditional_guidance_scale=unconditional_guidance_scale,
-                                  unconditional_conditioning=unconditional_conditioning)
+                                  unconditional_conditioning=unconditional_conditioning,
+                                  uc_mask=uc_mask)
     
     @torch.no_grad()
-    def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+    def sample_log(self, cond, c_mask, batch_size, ddim, ddim_steps, **kwargs):
         if ddim:
             ddim_sampler = DDIMSampler(self)
             if "shape" in kwargs:
@@ -978,17 +992,20 @@ class TextDiffusion(DDPM):
                                                          shape, cond, verbose=False, **kwargs)
 
         else:
-            samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
+            samples, intermediates = self.sample(cond=cond, c_mask=c_mask, batch_size=batch_size,
                                                  return_intermediates=True, **kwargs)
 
         return samples, intermediates
     
     @torch.no_grad()
-    def get_unconditional_conditioning(self, batch_size, null_label=None):
+    def get_unconditional_conditioning(self, batch_size, null_label=None, null_mask=None):
         if null_label is None:
             null_label = self.null_label
+        if null_mask is None:
+            null_mask = self.null_mask
         if null_label is not None:
             xc = null_label
+            xc_mask = null_mask
             if isinstance(xc, ListConfig):
                 xc = list(xc)
             if isinstance(xc, dict) or isinstance(xc, list):
@@ -996,12 +1013,14 @@ class TextDiffusion(DDPM):
             else:
                 if hasattr(xc, "to"):
                     xc = xc.to(self.device)
+                    xc_mask = xc_mask.to(self.device)
                 c = self.get_learned_conditioning(xc)
         else:
             # todo: get null label from cond_stage_model
             raise NotImplementedError()
         c = repeat(c.unsqueeze(0), '1 ... -> b ...', b=batch_size).to(self.device)
-        return c
+        c_mask = repeat(xc_mask.unsqueeze(0), '1 ... -> b ...', b=batch_size).to(self.device)
+        return c, c_mask
     
     @torch.no_grad()
     def log_texts(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
@@ -1013,7 +1032,7 @@ class TextDiffusion(DDPM):
         use_ddim = ddim_steps is not None
         
         log = dict()
-        z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
+        z, (c, c_mask), x, xrec, xc = self.get_input(batch, self.first_stage_key,
                                            return_first_stage_outputs=True,
                                            force_c_encode=True,
                                            return_original_cond=True,
@@ -1050,7 +1069,7 @@ class TextDiffusion(DDPM):
         if sample:
             # get denoise row
             with ema_scope("Sampling"):
-                samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
+                samples, z_denoise_row = self.sample_log(cond=c,c_mask=c_mask,batch_size=N,ddim=use_ddim,
                                                          ddim_steps=ddim_steps,eta=ddim_eta)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
             x_samples = self.decode_first_stage(samples, do_detokenize=True)
@@ -1061,23 +1080,25 @@ class TextDiffusion(DDPM):
         
         if isinstance(unconditional_guidance_scale, ListConfig):
             unconditional_guidance_scale = list(unconditional_guidance_scale)
-            uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)
+            uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             for scale in unconditional_guidance_scale:
                 with ema_scope(f"Sampling with classifier-free guidance {scale}"):
-                    samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                    samples_cfg, _ = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=use_ddim,
                                                     ddim_steps=ddim_steps, eta=ddim_eta,
                                                     unconditional_guidance_scale=scale,
                                                     unconditional_conditioning=uc,
+                                                    uc_mask=uc_mask
                                                     )
                     x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True)
                     log[f"samples_cfg_scale_{scale:.2f}"] = x_samples_cfg
         elif unconditional_guidance_scale > 1.0:
-            uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)
+            uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             with ema_scope(f"Sampling with classifier-free guidance {unconditional_guidance_scale}"):
-                samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                samples_cfg, _ = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=use_ddim,
                                                 ddim_steps=ddim_steps, eta=ddim_eta,
                                                 unconditional_guidance_scale=unconditional_guidance_scale,
                                                 unconditional_conditioning=uc,
+                                                uc_mask=uc_mask
                                                 )
                 x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True)
                 log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
@@ -1124,23 +1145,25 @@ class TextDiffusion(DDPM):
         unconditional_guidance_label = self.null_label.to(self.device)
         if isinstance(unconditional_guidance_scale, ListConfig):
             unconditional_guidance_scale = list(unconditional_guidance_scale)
-            uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)
+            uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             for scale in unconditional_guidance_scale:
                 with ema_scope(f"Sampling with classifier-free guidance {scale}"):
                     samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=False, ddim_steps=None,
                                                     unconditional_guidance_scale=scale,
                                                     unconditional_conditioning=uc,
+                                                    uc_mask=uc_mask
                                                     )
                     x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True, do_clean_detokenize=True)
                     with open(os.path.join(self.init_time, f"samples_cfg_scale_{scale}"), 'a') as f:
                         for sample in x_samples_cfg:
                             f.write(sample+'\n')
         elif unconditional_guidance_scale > 1.0:
-            uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)
+            uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             with ema_scope(f"Sampling with classifier-free guidance {unconditional_guidance_scale}"):
                 samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=False, ddim_steps=None,
                                                 unconditional_guidance_scale=unconditional_guidance_scale,
                                                 unconditional_conditioning=uc,
+                                                uc_mask=uc_mask
                                                 )
                 x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True, do_clean_detokenize=True)
                 with open(os.path.join(self.init_time, f"samples_cfg_scale_{unconditional_guidance_scale}"), 'a') as f:
@@ -1271,7 +1294,7 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm', 'hybrid-adm']
         
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None):
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None, c_mask=None):
         if self.conditioning_key is None:
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == 'concat':
@@ -1280,7 +1303,8 @@ class DiffusionWrapper(pl.LightningModule):
             out = out[:, :, :x.shape[2]]
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            c_mask = torch.cat(c_mask, 1)
+            out = self.diffusion_model(x, t, context=cc, c_mask=c_mask)
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)

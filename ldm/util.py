@@ -230,10 +230,13 @@ def get_tokenizer(tokenizer_type=None, outer_tokenizer=None):
     print(f'> Set tokenizer as a {tokenizer_type} tokenizer! Now you can get_tokenizer() everywhere.')
     return get_tokenizer.tokenizer
 
-def tokenize(x, sample_length):
+def tokenize(x, sample_length, return_mask=False):
     tokenizer = get_tokenizer()
     encoded_input = tokenizer(x, max_length=sample_length, padding='max_length', truncation='only_first')
-    return encoded_input['input_ids']
+    if return_mask:
+        return encoded_input['input_ids'], encoded_input['attention_mask']
+    else:
+        return encoded_input['input_ids']
     
 def detokenize(ids):
     tokenizer = get_tokenizer()

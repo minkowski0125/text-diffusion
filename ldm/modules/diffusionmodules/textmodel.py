@@ -1056,7 +1056,7 @@ class TransformerModel(nn.Module):
             self.output_down_proj = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size),
                                                     nn.Tanh(), nn.Linear(config.hidden_size, out_channels))
     
-    def forward(self, x, timesteps=None, context=None, y=None):
+    def forward(self, x, timesteps=None, context=None, y=None, c_mask=None):
         x = x.permute(0, 2, 1)
         assert (y is not None) == (
             self.num_classes is not None
@@ -1085,9 +1085,11 @@ class TransformerModel(nn.Module):
         if context is not None and self.cond == "cross":
             context_length = context.shape[1]
             context_position_ids = self.position_ids[:, :context_length]
+            if self.input_projection:
+                context = self.input_up_proj(context)
             context = self.position_embeddings(context_position_ids) + context
             context = self.encoder(context).last_hidden_state
-            h = self.input_transformers(emb_inputs, encoder_hidden_states=context).last_hidden_state
+            h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=c_mask).last_hidden_state
         else:
             h = self.input_transformers(emb_inputs).last_hidden_state
         if self.output_projection:
