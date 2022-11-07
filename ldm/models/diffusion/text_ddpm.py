@@ -598,6 +598,9 @@ class TextDiffusion(DDPM):
                 else:
                     xc = super().get_input(batch, cond_key).to(self.device)
                     xc_mask = super().get_input(batch, self.cond_attention_mask).to(self.device)
+                    if bs is not None:
+                        xc = xc[:bs]
+                        xc_mask = xc_mask[:bs]
             else:
                 xc = x
             
