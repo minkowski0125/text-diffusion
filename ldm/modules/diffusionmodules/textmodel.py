@@ -1088,8 +1088,16 @@ class TransformerModel(nn.Module):
             if self.input_projection:
                 context = self.input_up_proj(context)
             context = self.position_embeddings(context_position_ids) + context
-            context = self.encoder(context).last_hidden_state
-            h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=c_mask).last_hidden_state
+            
+            assert len(c_mask.shape) == 2
+            
+            dtype = next(self.parameters()).dtype
+            extended_c_mask = c_mask[:, None, None, :]
+            extended_c_mask = extended_c_mask.to(dtype=dtype)  # fp16 compatibility
+            extended_c_mask = (1.0 - extended_c_mask) * torch.finfo(dtype).min
+            
+            context = self.encoder(context, attention_mask=extended_c_mask).last_hidden_state
+            h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=extended_c_mask).last_hidden_state
         else:
             h = self.input_transformers(emb_inputs).last_hidden_state
         if self.output_projection:
