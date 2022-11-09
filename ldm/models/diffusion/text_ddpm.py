@@ -1302,7 +1302,8 @@ class DiffusionWrapper(pl.LightningModule):
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=2)
-            out = self.diffusion_model(xc, t)
+            c_mask = torch.cat(c_mask, 1)
+            out = self.diffusion_model(xc, t, c_mask=c_mask)
             out = out[:, :, :x.shape[2]]
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)

@@ -979,31 +979,6 @@ def instantiate_model(config_name, config, init_pretrained=False, local_files_on
             return RobertaEncoder(config)
         else:
             raise NotImplementedError
-        
-
-def invert_attention_mask(encoder_attention_mask, dtype):
-    """
-    Invert an attention mask (e.g., switches 0. and 1.).
-
-    Args:
-        encoder_attention_mask (`torch.Tensor`): An attention mask.
-
-    Returns:
-        `torch.Tensor`: The inverted attention mask.
-    """
-    if encoder_attention_mask.dim() == 3:
-        encoder_extended_attention_mask = encoder_attention_mask[:, None, :, :]
-    if encoder_attention_mask.dim() == 2:
-        encoder_extended_attention_mask = encoder_attention_mask[:, None, None, :]
-    # T5 has a mask that can compare sequence ids, we can simulate this here with this transposition
-    # Cf. https://github.com/tensorflow/mesh/blob/8d2465e9bc93129b913b5ccc6a59aa97abd96ec6/mesh_tensorflow
-    # /transformer/transformer_layers.py#L270
-    # encoder_extended_attention_mask = (encoder_extended_attention_mask ==
-    # encoder_extended_attention_mask.transpose(-1, -2))
-    # encoder_extended_attention_mask = encoder_extended_attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-    encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * torch.finfo(dtype).min
-
-    return encoder_extended_attention_mask
 
 class TransformerModel(nn.Module):
     """
@@ -1112,10 +1087,28 @@ class TransformerModel(nn.Module):
             if self.input_projection:
                 context = self.input_up_proj(context)
             context = self.position_embeddings(context_position_ids) + context
-            context = self.encoder(context).last_hidden_state
-            h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=invert_attention_mask(c_mask, context.dtype)).last_hidden_state
+            
+            assert len(c_mask.shape) == 2
+            
+            dtype = next(self.parameters()).dtype
+            extended_c_mask = c_mask[:, None, None, :]
+            extended_c_mask = extended_c_mask.to(dtype=dtype)  # fp16 compatibility
+            extended_c_mask = (1.0 - extended_c_mask) * torch.finfo(dtype).min
+            
+            context = self.encoder(context, attention_mask=extended_c_mask).last_hidden_state
+            h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=extended_c_mask).last_hidden_state
         else:
-            h = self.input_transformers(emb_inputs).last_hidden_state
+            attention_mask = None
+            if c_mask is not None:
+                pad_length = seq_length - c_mask.shape[1]
+                c_mask = F.pad(c_mask, (pad_length, 0), "constant", 1)
+                dtype = next(self.parameters()).dtype
+                extended_c_mask = c_mask[:, None, None, :]
+                extended_c_mask = extended_c_mask.to(dtype=dtype)  # fp16 compatibility
+                extended_c_mask = (1.0 - extended_c_mask) * torch.finfo(dtype).min
+                attention_mask = extended_c_mask
+
+            h = self.input_transformers(emb_inputs, attention_mask=attention_mask).last_hidden_state
         if self.output_projection:
             h = self.output_down_proj(h)
         return h.permute(0, 2, 1)

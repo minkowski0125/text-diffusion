@@ -14,7 +14,7 @@ model: # add base config
     channels: 1024
     cond_stage_trainable: false
     first_stage_trainable: false
-    conditioning_key: crossattn
+    conditioning_key: concat
     monitor: val/loss_simple_ema
     scale_factor: 1
     uncond_training_ratio: 0.1
