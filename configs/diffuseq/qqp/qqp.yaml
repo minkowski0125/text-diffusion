@@ -9,6 +9,7 @@ model: # add base config
     timesteps: 1000
     first_stage_key: input_ids
     cond_stage_key: cond_input_ids
+    cond_attention_mask: cond_attention_mask
     text_length: 64
     channels: 768
     cond_stage_trainable: false
@@ -16,7 +17,7 @@ model: # add base config
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 1
-    # uncond_training_ratio: 0.1
+    uncond_training_ratio: 0.1
     unconditional_guidance_scale: [1.1, 1.5, 2, 5, 10, 50, 100]
     use_ema: False
     parameterization: x0
@@ -77,12 +78,12 @@ data:
 lightning:
   modelcheckpoint:
     params:
-      every_n_train_steps: 10000
+      every_n_train_steps: 20000
   callbacks:
     text_logger:
       target: main.TextLogger
       params:
-        batch_frequency: 10000
+        batch_frequency: 20000
         max_texts: 64
         increase_log_steps: False
         log_first_step: False

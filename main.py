@@ -122,6 +122,16 @@ def get_parser(**parser_kwargs):
         default=True,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
     )
+    parser.add_argument(
+        '--num_shards',
+        type=int,
+        default=None
+    )
+    parser.add_argument(
+        '--shard_id',
+        type=int,
+        default=None
+    )
     return parser
 
 
@@ -734,6 +744,9 @@ if __name__ == "__main__":
         get_tokenizer(tokenizer_type)
 
         # model
+        config.model.params.logdir = logdir
+        config.model.params.num_shards = opt.num_shards
+        config.model.params.shard_id = opt.shard_id
         model = instantiate_from_config(config.model)
 
         # trainer and callbacks
@@ -883,6 +896,8 @@ if __name__ == "__main__":
         trainer.logdir = logdir  ###
 
         # data
+        config.data.params.test.params.num_shards = opt.num_shards
+        config.data.params.test.params.shard_id = opt.shard_id
         data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.

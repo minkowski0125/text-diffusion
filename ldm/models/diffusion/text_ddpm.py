@@ -434,6 +434,7 @@ class TextDiffusion(DDPM):
     def __init__(self,
                  first_stage_config,
                  cond_stage_config,
+                 logdir,
                  num_timesteps_cond=None,
                  cond_stage_key="class_label",
                  cond_attention_mask="cond_attention_mask",
@@ -447,6 +448,8 @@ class TextDiffusion(DDPM):
                  uncond_training_ratio=0.,
                  unconditional_guidance_scale=1.,
                  null_label="",
+                 num_shards=None,
+                 shard_id=None,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -486,7 +489,9 @@ class TextDiffusion(DDPM):
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
         
-        self.init_time = datetime.now().strftime('%y%m%d-%H%M%S')
+        self.logdir = logdir
+        self.num_shards = num_shards
+        self.shard_id = shard_id
     
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -1121,23 +1126,28 @@ class TextDiffusion(DDPM):
     @torch.no_grad()
     def test_step(self, batch, batch_idx):
         ema_scope = self.ema_scope
-        x, c, ids = self.get_input(batch, self.first_stage_key, return_x=True)
+        x, (c, c_mask), ids = self.get_input(batch, self.first_stage_key, return_x=True)
         
         N = x.shape[0]
         
-        os.makedirs(self.init_time, exist_ok=True)
+        test_dir = os.path.join(self.logdir, "tests")
+        os.makedirs(test_dir, exist_ok=True)
+        if self.num_shards is not None and self.shard_id is not None:
+            postfix = f"_{self.shard_id}_{self.num_shards}"
+        else:
+            postfix = ""
         
-        with open(os.path.join(self.init_time, "inputs"), 'a') as f:
+        with open(os.path.join(test_dir, "inputs" + postfix), 'a') as f:
             for sample in ids:
                 f.write(clean_detokenize(sample)+'\n')
-        with open(os.path.join(self.init_time, "conditions"), 'a') as f:
+        with open(os.path.join(test_dir, "conditions" + postfix), 'a') as f:
             for sample in self.decode_first_stage(c, do_detokenize=True, do_clean_detokenize=True):
                 f.write(sample+'\n')
         
         with ema_scope("Sampling"):
-            samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=False, ddim_steps=None)
+            samples, z_denoise_row = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=False, ddim_steps=None)
             x_samples = self.decode_first_stage(samples, do_detokenize=True, do_clean_detokenize=True)
-            with open(os.path.join(self.init_time, "samples"), 'a') as f:
+            with open(os.path.join(test_dir, "samples" + postfix), 'a') as f:
                 for sample in x_samples:
                     f.write(sample+'\n')
         
@@ -1148,25 +1158,25 @@ class TextDiffusion(DDPM):
             uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             for scale in unconditional_guidance_scale:
                 with ema_scope(f"Sampling with classifier-free guidance {scale}"):
-                    samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=False, ddim_steps=None,
+                    samples_cfg, _ = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=False, ddim_steps=None,
                                                     unconditional_guidance_scale=scale,
                                                     unconditional_conditioning=uc,
                                                     uc_mask=uc_mask
                                                     )
                     x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True, do_clean_detokenize=True)
-                    with open(os.path.join(self.init_time, f"samples_cfg_scale_{scale}"), 'a') as f:
+                    with open(os.path.join(test_dir, f"samples_cfg_scale_{scale}" + postfix), 'a') as f:
                         for sample in x_samples_cfg:
                             f.write(sample+'\n')
         elif unconditional_guidance_scale > 1.0:
             uc, uc_mask = self.get_unconditional_conditioning(N, unconditional_guidance_label)
             with ema_scope(f"Sampling with classifier-free guidance {unconditional_guidance_scale}"):
-                samples_cfg, _ = self.sample_log(cond=c, batch_size=N, ddim=False, ddim_steps=None,
+                samples_cfg, _ = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=False, ddim_steps=None,
                                                 unconditional_guidance_scale=unconditional_guidance_scale,
                                                 unconditional_conditioning=uc,
                                                 uc_mask=uc_mask
                                                 )
                 x_samples_cfg = self.decode_first_stage(samples_cfg, do_detokenize=True, do_clean_detokenize=True)
-                with open(os.path.join(self.init_time, f"samples_cfg_scale_{unconditional_guidance_scale}"), 'a') as f:
+                with open(os.path.join(test_dir, f"samples_cfg_scale_{unconditional_guidance_scale}" + postfix), 'a') as f:
                     for sample in x_samples_cfg:
                         f.write(sample+'\n')
     
@@ -1223,7 +1233,7 @@ class TextDiffusionRounding(TextDiffusion):
         decoder_nll = decoder_nll.mean(dim=-1)
         return decoder_nll
     
-    def p_losses(self, x_start, ids, cond, t, noise=None):
+    def p_losses(self, x_start, ids, cond, cond_mask, t, noise=None):
         if self.first_stage_trainable:
             x_start_mean = self.get_first_stage_encoding(self.first_stage_model.encode(ids, do_tokenize=False))
         else:
@@ -1237,7 +1247,7 @@ class TextDiffusionRounding(TextDiffusion):
         
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy, t, cond, cond_mask)
         
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
