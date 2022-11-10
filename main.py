@@ -125,12 +125,12 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         '--num_shards',
         type=int,
-        default=None
+        default=1
     )
     parser.add_argument(
         '--shard_id',
         type=int,
-        default=None
+        default=0
     )
     return parser
 
