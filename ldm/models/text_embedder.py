@@ -49,21 +49,15 @@ class TextEmbedderLMHead(nn.Module):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.text_length = sample_length
-        
-        if ckpt_path is not None:
-            self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
-            self.lm_head = nn.Linear(hidden_size, vocab_size)
-            state_dict = torch.load(ckpt_path)
-            self.load_state_dict(state_dict)
-        elif embedding_ckpt_path is not None:
+
+        if embedding_ckpt_path is not None:
             state_dict = torch.load(embedding_ckpt_path)
             word_embeddings_weight = state_dict['module']['transformer.word_embeddings.weight']
             self.word_embeddings = nn.Embedding(vocab_size, hidden_size, 
                                                   _weight=word_embeddings_weight)
-            self.lm_head = nn.Linear(hidden_size, vocab_size)
         else:
             self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
-            self.lm_head = nn.Linear(hidden_size, vocab_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
     
     def encode(self, x, **kwargs):
         return self.word_embeddings(x).transpose(-1, -2)

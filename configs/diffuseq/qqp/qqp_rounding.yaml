@@ -1,5 +1,5 @@
 model: # add base config
-  base_learning_rate: 1.0e-04
+  base_learning_rate: 1.0e-05
   target: ldm.models.diffusion.text_ddpm.TextDiffusionRounding
   params:
     linear_start: 0.00085
@@ -17,7 +17,7 @@ model: # add base config
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 1
-    # uncond_training_ratio: 0.1
+    uncond_training_ratio: 0.1
     unconditional_guidance_scale: [1.5, 2, 5, 10, 50]
     use_ema: False
     parameterization: x0
@@ -95,5 +95,5 @@ lightning:
 
   trainer:
     benchmark: True
-    max_steps: 200000
+    max_steps: 500000
   

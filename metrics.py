@@ -105,12 +105,26 @@ def calc_div(lines, n=4):
 
 if __name__ == "__main__":
     metric = sys.argv[1]
-    src, dst = sys.argv[2], sys.argv[3]
+    src_prefix, dst_prefix = sys.argv[2], sys.argv[3]
+    try:
+        num_shards = int(sys.argv[4])
+    except:
+        num_shards = 1
     
-    with open(src, 'r') as src_f:
-        src_lines = [line.strip() for line in src_f][:10]
-    with open(dst, 'r') as dst_f:
-        dst_lines = [line.strip() for line in dst_f][:10]
+    total_src_lines, total_dst_lines = [], []
+    for i in range(num_shards):
+        src = src_prefix + str(i) + "_" + str(num_shards)
+        dst = dst_prefix + str(i) + "_" + str(num_shards)
+        with open(src, 'r') as src_f:
+            src_lines = [line.strip() for line in src_f]
+        with open(dst, 'r') as dst_f:
+            dst_lines = [line.strip() for line in dst_f]
+        
+        min_len = min(len(src_lines), len(dst_lines))
+        total_src_lines.append(src_lines[:min_len])
+        total_dst_lines.append(dst_lines[:min_len])
+    src_lines = total_src_lines
+    dst_lines = total_dst_lines
     
     metric = metric.lower()
     print(f"testing with {metric}")
