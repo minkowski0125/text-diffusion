@@ -43,10 +43,30 @@ class TextEmbedder(nn.Module):
         x = x.to(self.device)
         return self.encode(x)
 
-class TextEmbedderLMHead(TextEmbedder):
-    def __init__(self, vocab_size, hidden_size, sample_length, embedding_ckpt_path=None, embedding_init_std=0.02, **kwargs):
-        super().__init__(vocab_size, hidden_size, sample_length, embedding_ckpt_path, embedding_init_std, **kwargs)
-        self.lm_head = nn.Linear(hidden_size, vocab_size)
+class TextEmbedderLMHead(nn.Module):
+    def __init__(self, vocab_size, hidden_size, sample_length, ckpt_path=None, embedding_ckpt_path=None, embedding_init_std=0.02, **kwargs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.text_length = sample_length
+        
+        if ckpt_path is not None:
+            self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = nn.Linear(hidden_size, vocab_size)
+            state_dict = torch.load(ckpt_path)
+            self.load_state_dict(state_dict)
+        elif embedding_ckpt_path is not None:
+            state_dict = torch.load(embedding_ckpt_path)
+            word_embeddings_weight = state_dict['module']['transformer.word_embeddings.weight']
+            self.word_embeddings = nn.Embedding(vocab_size, hidden_size, 
+                                                  _weight=word_embeddings_weight)
+            self.lm_head = nn.Linear(hidden_size, vocab_size)
+        else:
+            self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = nn.Linear(hidden_size, vocab_size)
+    
+    def encode(self, x, **kwargs):
+        return self.word_embeddings(x).transpose(-1, -2)
         
     def decode(self, x, do_detokenize=False, **kwargs): # x: b c l
         logits = self.get_logits(x)
@@ -56,3 +76,7 @@ class TextEmbedderLMHead(TextEmbedder):
     def get_logits(self, x):
         x = x.permute(0, 2, 1)
         return self.lm_head(x)
+    
+    def forward(self, x):
+        x = x.to(self.device)
+        return self.encode(x)

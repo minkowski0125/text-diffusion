@@ -744,6 +744,8 @@ if __name__ == "__main__":
         get_tokenizer(tokenizer_type)
 
         # model
+        if opt.resume:
+            config.model.params.ckpt_path = opt.resume_from_checkpoint
         config.model.params.logdir = logdir
         config.model.params.num_shards = opt.num_shards
         config.model.params.shard_id = opt.shard_id
