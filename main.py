@@ -898,8 +898,9 @@ if __name__ == "__main__":
         trainer.logdir = logdir  ###
 
         # data
-        config.data.params.test.params.num_shards = opt.num_shards
-        config.data.params.test.params.shard_id = opt.shard_id
+        if 'test' in config.data.params:
+            config.data.params.test.params.num_shards = opt.num_shards
+            config.data.params.test.params.shard_id = opt.shard_id
         data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.
