@@ -1107,3 +1107,107 @@ class TransformerModel(nn.Module):
         
         
         
+class MaskTransformerModel(nn.Module):
+    """
+    easy-load transformer model based on huggingface
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        model_channels,
+        num_classes=None,
+        dropout=0.1,
+        config=None,
+        config_name='bert-base-uncased',
+        init_pretrained=False,
+        cond=None,
+        cond_config=None,
+        cond_config_name=None,
+        cond_init_pretrained=False,
+        input_projection=False,
+        output_projection=False
+    ):
+        super().__init__()
+        
+        if config is None:
+            config = AutoConfig.from_pretrained(config_name, local_files_only=True)
+            config.hidden_dropout_prob = dropout
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.model_channels = model_channels
+        self.dropout = dropout
+        self.num_classes = num_classes
+        self.input_projection = input_projection
+        self.output_projection = output_projection
+        self.cond = cond
+        if cond == 'cross':
+            config.is_decoder = True
+            config.add_cross_attention = True
+            
+            assert cond_config_name is not None or cond_config is not None
+            if cond_config is None:
+                cond_config = AutoConfig.from_pretrained(cond_config_name, local_files_only=True)
+                config.hidden_dropout_prob = dropout
+            
+            self.encoder = instantiate_model(cond_config_name, cond_config, cond_init_pretrained)
+        elif cond == 'concat':
+            pass
+        elif cond is not None:
+            raise NotImplementedError
+        
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, config.hidden_size)
+        )
+        
+        if self.num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+        
+        self.input_transformers = instantiate_model(config_name, config, init_pretrained)
+        
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.mask_embeddings = nn.Embedding(2, config.hidden_size)
+        # self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        if input_projection:
+            self.input_up_proj = nn.Sequential(nn.Linear(in_channels, config.hidden_size),
+                                                nn.Tanh(), nn.Linear(config.hidden_size, config.hidden_size))
+        if output_projection:
+            self.output_down_proj = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size),
+                                                    nn.Tanh(), nn.Linear(config.hidden_size, out_channels))
+    
+    def forward(self, x, timesteps=None, attention_mask=None, diffusion_mask=None):
+        x = x.permute(0, 2, 1)
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+        
+        if self.input_projection:
+            x = self.input_up_proj(x)
+        
+        seq_length = x.shape[1]
+        position_ids = self.position_ids[:, :seq_length]
+        mask_embedding = self.mask_embeddings(diffusion_mask)
+        emb_inputs = self.position_embeddings(position_ids) + x + emb.unsqueeze(1).expand(-1, seq_length, -1) + mask_embedding
+        emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
+        
+        
+        dtype = next(self.parameters()).dtype
+        extended_mask = attention_mask[:, None, None, :]
+        extended_mask = extended_mask.to(dtype=dtype)  # fp16 compatibility
+        extended_mask = (1.0 - extended_mask) * torch.finfo(dtype).min
+        attention_mask = extended_mask
+        h = self.input_transformers(emb_inputs, attention_mask=attention_mask).last_hidden_state
+        if self.output_projection:
+            h = self.output_down_proj(h)
+        return h.permute(0, 2, 1)
+            
+        
+        
+        

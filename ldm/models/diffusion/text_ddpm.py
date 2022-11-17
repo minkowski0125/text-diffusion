@@ -459,6 +459,8 @@ class TextDiffusion(DDPM):
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         if cond_stage_config == '__is_unconditional__':
             conditioning_key = None
+        elif cond_stage_config == '__is_mask__':
+            conditioning_key = '__is_mask__'
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
@@ -541,6 +543,9 @@ class TextDiffusion(DDPM):
                 print(f"Training {self.__class__.__name__} as an unconditional model.")
                 self.cond_stage_model = None
                 # self.be_unconditional = True
+            elif config == "__is_mask__":
+                print(f"Training {self.__class__.__name__} as a mask conditional model.")
+                self.cond_stage_model = None
             else:
                 model = instantiate_from_config(config)
                 self.cond_stage_model = model.eval()
@@ -591,8 +596,13 @@ class TextDiffusion(DDPM):
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        if self.model.conditioning_key == '__is_mask__':
+            attention_mask = super().get_input(batch, "attention_mask").to(self.device)
+            diffusion_mask = super().get_input(batch, "diffusion_masks").to(self.device)
+            return [z, attention_mask, diffusion_mask]
         
-        if self.model.conditioning_key is not None:
+        elif self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
@@ -643,6 +653,7 @@ class TextDiffusion(DDPM):
         else:
             c = None
             xc = None
+            xc_mask = None
             # if self.use_positional_encodings:
             #     pos_x, pos_y = self.compute_latent_shifts(batch)
             #     c = {'pos_x': pos_x, 'pos_y': pos_y}
@@ -680,9 +691,58 @@ class TextDiffusion(DDPM):
         return x
     
     def shared_step(self, batch, **kwargs):
-        x, (c, c_mask), ids = self.get_input(batch, self.first_stage_key, return_x=True, sampling_uncond=True)
-        loss = self(x, ids, c, c_mask)
+        if self.model.conditioning_key == '__is_mask__':
+            x, attention_mask, diffusion_mask = self.get_input(batch, self.first_stage_key, return_x=True, sampling_uncond=True)
+            loss = self.mask_forward(x, attention_mask, diffusion_mask)
+        else:
+            x, (c, c_mask), ids = self.get_input(batch, self.first_stage_key, return_x=True, sampling_uncond=True)
+            loss = self(x, ids, c, c_mask)
         return loss
+    
+    def mask_forward(self, x, attention_mask, diffusion_mask):
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        return self.mask_p_losses(x, attention_mask, diffusion_mask, t)
+
+    def mask_p_losses(self, x_start, attention_mask, diffusion_mask, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        # make x_start unchanged for diffusion_mask=0
+        diff_mask = diffusion_mask[:, None, :]
+        x_noisy = diff_mask * x_noisy + (1 - diff_mask) * x_start
+        model_output = self.mask_apply_model(x_noisy, t, attention_mask, diffusion_mask)
+        
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+        
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+        
+        loss_simple = self.get_loss(model_output*diff_mask, target*diff_mask, mean=False).mean([1, 2])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+        
+        logvar_t = self.logvar[t].to(self.device)
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+            
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output*diff_mask, target*diff_mask, mean=False).mean(dim=(1, 2))
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+        
+        return loss, loss_dict
+    
+    def mask_apply_model(self, x_noisy, t, attention_mask, diffusion_mask):
+        return self.model(x_noisy, t, attention_mask=attention_mask, diffusion_mask=diffusion_mask)
     
     def forward(self, x, ids, c, c_mask, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
@@ -1302,10 +1362,12 @@ class DiffusionWrapper(pl.LightningModule):
         super().__init__()
         self.diffusion_model = instantiate_from_config(diff_model_config)
         self.conditioning_key = conditioning_key
-        assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm', 'hybrid-adm']
+        assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm', 'hybrid-adm', '__is_mask__']
         
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None, c_mask=None):
-        if self.conditioning_key is None:
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None, c_mask=None, attention_mask=None, diffusion_mask=None):
+        if self.conditioning_key == '__is_mask__':
+            out = self.diffusion_model(x, t, attention_mask, diffusion_mask)
+        elif self.conditioning_key is None:
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=2)
