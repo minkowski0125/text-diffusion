@@ -831,6 +831,18 @@ class TextDiffusion(DDPM):
         
         return loss, loss_dict
     
+    def mask_p_mean_variance(self, x, t, attention_mask, diffusion_mask):
+        model_out = self.mask_apply_model(x, t, attention_mask, diffusion_mask)
+
+        if self.parameterization == "eps":
+            x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
+        elif self.parameterization == "x0":
+            x_recon = model_out
+        else:
+            raise NotImplementedError()
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+        return model_mean, posterior_variance, posterior_log_variance
+    
     def p_mean_variance(self, x, c, c_mask, t, clip_denoised: bool, return_codebook_ids=False,
                         return_x0=False, score_corrector=None, corrector_kwargs=None,
                         unconditional_guidance_scale=1., unconditional_conditioning=None, uc_mask=None):
@@ -879,6 +891,16 @@ class TextDiffusion(DDPM):
             return model_mean, posterior_variance, posterior_log_variance, x_recon
         else:
             return model_mean, posterior_variance, posterior_log_variance
+        
+    @torch.no_grad()
+    def mask_p_sample(self, x, t, attention_mask, diffusion_mask):
+        b, *_, device = *x.shape, x.device
+        outputs = self.mask_p_mean_variance(x, t, attention_mask, diffusion_mask)
+        model_mean, _, model_log_variance = outputs
+        noise = noise_like(x.shape, device)
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
     
     @torch.no_grad()
     def p_sample(self, x, c, c_mask, t, clip_denoised=False, repeat_noise=False,
@@ -1021,6 +1043,43 @@ class TextDiffusion(DDPM):
         if return_intermediates:
             return txt, intermediates
         return txt
+    
+    @torch.no_grad()
+    def mask_p_sample_loop(self, inputs, attention_mask, diffusion_mask, log_every_t=None, return_intermediates=False):
+        
+        if not log_every_t:
+            log_every_t = self.log_every_t
+        device = self.betas.device
+        b = inputs.shape[0]
+        txt = torch.randn(inputs.shape, device=device)
+        
+        intermediates = [txt]
+        timesteps = self.num_timesteps
+        
+        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps)
+        diff_mask = diffusion_mask[:, None, :]
+        
+        for i in iterator:
+            ts = torch.full((b,), i, device=device, dtype=torch.long)
+            
+            txt = diff_mask * txt + (1 - diff_mask) * inputs
+            txt = self.mask_p_sample(txt, ts, attention_mask, diffusion_mask)
+            
+            if i % log_every_t == 0 or i == timesteps - 1:
+                intermediates.append(txt)
+        txt = diff_mask * txt + (1 - diff_mask) * inputs
+        
+        if return_intermediates:
+            return txt, intermediates
+        return txt
+    
+    @torch.no_grad()
+    def mask_sample(self, input_ids, attention_mask, diffusion_mask):
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        diffusion_mask = diffusion_mask.to(self.device)
+        inputs = self.get_first_stage_encoding(self.first_stage_model.encode(input_ids))
+        return self.mask_p_sample_loop(inputs, attention_mask, diffusion_mask)
     
     @torch.no_grad()
     def sample(self, cond, c_mask, batch_size=16, return_intermediates=False, x_T=None,
