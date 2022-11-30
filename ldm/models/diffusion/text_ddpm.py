@@ -435,6 +435,7 @@ class TextDiffusion(DDPM):
                  first_stage_config,
                  cond_stage_config,
                  logdir,
+                 tokenizer_type,
                  num_timesteps_cond=None,
                  cond_stage_key="class_label",
                  cond_attention_mask="cond_attention_mask",
@@ -453,6 +454,12 @@ class TextDiffusion(DDPM):
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
+        
+        self.tokenizer_type = tokenizer_type
+        self.tokenize = partial(tokenize, tokenizer_type=tokenizer_type)
+        self.detokenize = partial(detokenize, tokenizer_type=tokenizer_type)
+        self.clean_detokenize = partial(clean_detokenize, tokenizer_type=tokenizer_type)
+        
         assert self.num_timesteps_cond <= kwargs['timesteps']
         # for backwards compatibility after implementation of DiffusionWrapper
         if conditioning_key is None:
@@ -481,7 +488,7 @@ class TextDiffusion(DDPM):
         self.clip_denoised = False
         self.uncond_training_ratio = uncond_training_ratio
         self.unconditional_guidance_scale = unconditional_guidance_scale
-        self.null_label, self.null_mask = tokenize(null_label, self.text_length, return_mask=True)
+        self.null_label, self.null_mask = self.tokenize(null_label, self.text_length, return_mask=True)
         self.null_label, self.null_mask = torch.tensor(self.null_label), torch.tensor(self.null_mask)
 
         self.restarted_from_ckpt = False
@@ -500,7 +507,7 @@ class TextDiffusion(DDPM):
         
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -642,6 +649,7 @@ class TextDiffusion(DDPM):
             
         else:
             c = None
+            xc_mask= None
             xc = None
             # if self.use_positional_encodings:
             #     pos_x, pos_y = self.compute_latent_shifts(batch)
@@ -662,9 +670,9 @@ class TextDiffusion(DDPM):
         ids = self.first_stage_model.decode(z)
         if do_detokenize:
             if do_clean_detokenize:
-                detokenize_func = clean_detokenize
+                detokenize_func = self.clean_detokenize
             else:
-                detokenize_func = detokenize
+                detokenize_func = self.detokenize
             txts = []
             for item in ids:
                 txts.append(detokenize_func(item))
@@ -675,7 +683,7 @@ class TextDiffusion(DDPM):
     @torch.no_grad()
     def encode_first_stage(self, x, do_tokenize=False):
         if do_tokenize:
-            x = torch.tensor(tokenize(x, self.text_length), device=self.device)
+            x = torch.tensor(self.tokenize(x, self.text_length), device=self.device)
         x = self.first_stage_model.encode(x)
         return x
     
@@ -738,6 +746,7 @@ class TextDiffusion(DDPM):
             x_start = self.get_first_stage_encoding(self.first_stage_model.encode(ids, do_tokenize=False))
         
         noise = default(noise, lambda: torch.randn_like(x_start))
+        breakpoint()
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond, cond_mask)
         
@@ -949,6 +958,7 @@ class TextDiffusion(DDPM):
                                 unconditional_guidance_scale=unconditional_guidance_scale,
                                 unconditional_conditioning=unconditional_conditioning,
                                 uc_mask=uc_mask)
+            breakpoint()
             if mask is not None:
                 txt_orig = self.q_sample(x0, ts)
                 txt = txt_orig * mask + (1. - mask) * txt
@@ -1044,8 +1054,8 @@ class TextDiffusion(DDPM):
                                            bs=N)
         N = min(x.shape[0], N)
         
-        log["inputs"] = [detokenize(ids) for ids in x]
-        log["reconstruction"] = [detokenize(ids) for ids in xrec]
+        log["inputs"] = [self.detokenize(ids) for ids in x]
+        log["reconstruction"] = [self.detokenize(ids) for ids in xrec]
         
         if self.model.conditioning_key is not None:
             # only for txt now
@@ -1056,7 +1066,7 @@ class TextDiffusion(DDPM):
                 xc = batch['human_label']
                 log['conditioning'] = [str(i) for i in xc]
             elif self.cond_stage_key == 'cond_input_ids':
-                log['conditioning'] = [detokenize(ids) for ids in xc]
+                log['conditioning'] = [self.detokenize(ids) for ids in xc]
         
         # if plot_diffusion_rows:
         #     diffusion_row = list()
@@ -1139,10 +1149,12 @@ class TextDiffusion(DDPM):
         
         with open(os.path.join(test_dir, "inputs" + postfix), 'a') as f:
             for sample in ids:
-                f.write(clean_detokenize(sample)+'\n')
-        with open(os.path.join(test_dir, "conditions" + postfix), 'a') as f:
-            for sample in self.decode_first_stage(c, do_detokenize=True, do_clean_detokenize=True):
-                f.write(sample+'\n')
+                f.write(self.clean_detokenize(sample)+'\n')
+        
+        if c is not None:
+            with open(os.path.join(test_dir, "conditions" + postfix), 'a') as f:
+                for sample in self.decode_first_stage(c, do_detokenize=True, do_clean_detokenize=True):
+                    f.write(sample+'\n')
         
         with ema_scope("Sampling"):
             samples, z_denoise_row = self.sample_log(cond=c, c_mask=c_mask, batch_size=N, ddim=False, ddim_steps=None)

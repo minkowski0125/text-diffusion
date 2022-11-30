@@ -62,7 +62,7 @@ class TextEmbedderLMHead(nn.Module):
     def encode(self, x, **kwargs):
         return self.word_embeddings(x).transpose(-1, -2)
         
-    def decode(self, x, do_detokenize=False, **kwargs): # x: b c l
+    def decode(self, x, **kwargs): # x: b c l
         logits = self.get_logits(x)
         x = logits.argmax(dim=-1)
         return x
@@ -70,6 +70,26 @@ class TextEmbedderLMHead(nn.Module):
     def get_logits(self, x):
         x = x.permute(0, 2, 1)
         return self.lm_head(x)
+    
+    def forward(self, x):
+        x = x.to(self.device)
+        return self.encode(x)
+    
+class OnehotEmbedder(nn.Module):
+    def __init__(self, vocab_size, sample_length, **kwargs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.text_length = sample_length
+    
+    def encode(self, x, **kwargs):
+        bs = x.shape[0]
+        output = torch.zeros(bs, self.vocab_size, self.text_length, device=x.device)
+        output.scatter_(1, x.unsqueeze(1), torch.ones_like(output))
+        return output
+
+    def decode(self, x, **kwargs):
+        x = x.argmax(dim=-2)
+        return x
     
     def forward(self, x):
         x = x.to(self.device)

@@ -18,10 +18,17 @@ from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
-from ldm.util import instantiate_from_config, get_tokenizer
+from ldm.util import instantiate_from_config
 
-MULTINODE_HACKS = True
+def load_model_from_config(config, ckpt, strict=True, verbose=False):
+    print(f"Loading model from {ckpt}")
+    config.model.params.ckpt_path = ckpt
+    model = instantiate_from_config(config.model)
 
+    # if model.use_ema: # TODO move inside
+    #     model.model_ema(model.model, force_overwrite=True)
+
+    return model
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -119,18 +126,26 @@ def get_parser(**parser_kwargs):
         type=str2bool,
         nargs="?",
         const=True,
-        default=True,
+        default=False,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
+    )
+    parser.add_argument(
+        "--ignore-unexpected-keys",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="The released model is not exact the configured ones.",
     )
     parser.add_argument(
         '--num_shards',
         type=int,
-        default=1
+        default=None
     )
     parser.add_argument(
         '--shard_id',
         type=int,
-        default=0
+        default=None
     )
     return parser
 
@@ -174,7 +189,7 @@ def worker_init_fn(_):
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
-                 shuffle_val_dataloader=False):
+                 shuffle_val_dataloader=False, prefetch_factor=4):
         super().__init__()
         self.batch_size = batch_size
         self.dataset_configs = dict()
@@ -193,6 +208,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             self.dataset_configs["predict"] = predict
             self.predict_dataloader = self._predict_dataloader
         self.wrap = wrap
+        self.prefetch_factor = prefetch_factor
 
     def prepare_data(self):
         for data_cfg in self.dataset_configs.values():
@@ -207,14 +223,15 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
+        is_iterable_dataset = isinstance(self.datasets['train'], torch.utils.data.IterableDataset)
+        is_ldm_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
+        if is_ldm_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
             init_fn = None
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn)
+                          worker_init_fn=init_fn, prefetch_factor=self.prefetch_factor)
 
     def _val_dataloader(self, shuffle=False):
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -225,7 +242,9 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
                           worker_init_fn=init_fn,
-                          shuffle=shuffle)
+                          shuffle=shuffle,
+                          prefetch_factor=self.prefetch_factor
+                          )
 
     def _test_dataloader(self, shuffle=False):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
@@ -250,8 +269,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
 
 class SetupCallback(Callback):
-    def __init__(self, resume, now, logdir, ckptdir, cfgdir, config,
-                 lightning_config, debug):
+    def __init__(self, resume, now, logdir, ckptdir, cfgdir, config, lightning_config):
         super().__init__()
         self.resume = resume
         self.now = now
@@ -260,13 +278,12 @@ class SetupCallback(Callback):
         self.cfgdir = cfgdir
         self.config = config
         self.lightning_config = lightning_config
-        self.debug = debug
 
-    def on_keyboard_interrupt(self, trainer, pl_module):
-        if not self.debug and trainer.global_rank == 0:
-            print("Summoning checkpoint.")
-            ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
-            trainer.save_checkpoint(ckpt_path)
+    # def on_keyboard_interrupt(self, trainer, pl_module):
+    #     if not self.debug and trainer.global_rank == 0:
+    #         print("Summoning checkpoint.")
+    #         ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
+    #         trainer.save_checkpoint(ckpt_path)
 
     def on_pretrain_routine_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
@@ -280,9 +297,6 @@ class SetupCallback(Callback):
                     os.makedirs(os.path.join(self.ckptdir, 'trainstep_checkpoints'), exist_ok=True)
             print("Project config")
             print(OmegaConf.to_yaml(self.config))
-            if MULTINODE_HACKS:
-                import time
-                time.sleep(5)
             OmegaConf.save(self.config,
                            os.path.join(self.cfgdir, "{}-project.yaml".format(self.now)))
 
@@ -292,15 +306,16 @@ class SetupCallback(Callback):
                            os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
 
         else:
-            # ModelCheckpoint callback created log directory --- remove it
-            if not MULTINODE_HACKS and not self.resume and os.path.exists(self.logdir):
-                dst, name = os.path.split(self.logdir)
-                dst = os.path.join(dst, "child_runs", name)
-                os.makedirs(os.path.split(dst)[0], exist_ok=True)
-                try:
-                    os.rename(self.logdir, dst)
-                except FileNotFoundError:
-                    pass
+            pass
+            # # ModelCheckpoint callback created log directory --- remove it
+            # if not MULTINODE_HACKS and not self.resume and os.path.exists(self.logdir):
+            #     dst, name = os.path.split(self.logdir)
+            #     dst = os.path.join(dst, "child_runs", name)
+            #     os.makedirs(os.path.split(dst)[0], exist_ok=True)
+            #     try:
+            #         os.rename(self.logdir, dst)
+            #     except FileNotFoundError:
+            #         pass
 
 class TextLogger(Callback):
     def __init__(self, batch_frequency, max_texts, clamp=True, increase_log_steps=True,
@@ -338,6 +353,7 @@ class TextLogger(Callback):
                 batch_idx)
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
+            print("path:", path)
             with open(path, 'w') as log_file:
                 for text in texts[k]:
                     log_file.write(text+'\n')
@@ -381,7 +397,7 @@ class TextLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_txt(pl_module, batch, batch_idx, split="train")
 
@@ -507,7 +523,7 @@ class CUDACallback(Callback):
         torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
+    def on_train_epoch_end(self, trainer, pl_module):
         torch.cuda.synchronize(trainer.root_gpu)
         max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
@@ -624,6 +640,7 @@ class SingleImageLogger(Callback):
 
 
 if __name__ == "__main__":
+    torch.backends.cudnn.benchmark=False; torch.backends.cudnn.deterministic=True
     # custom parser to specify config files, train, test and debug mode,
     # postfix, resume.
     # `--key value` arguments are interpreted as arguments to the trainer.
@@ -682,25 +699,55 @@ if __name__ == "__main__":
             "If you want to resume training in a new log folder, "
             "use -n/--name in combination with --resume_from_checkpoint"
         )
+    # # ---- BEG auto-detect resume ----
+    # # detected_ckpt_path = None
+    # # opt.name is {job_id}.{jobname}, folder name is {time}_{opt.name}
+    # def exact_cont(s):
+    #     if s.endswith('continue'):
+    #         return int(s.split('_')[-1][:-8])
+    #     else:
+    #         return 0
+    
+    # best_cont = -1
+    # if os.path.exists(opt.logdir):
+    #     for subfolder in os.listdir(opt.logdir):
+    #         if opt.name in subfolder:
+    #             cont_num = exact_cont(subfolder)
+    #             ckpt_path = os.path.join(opt.logdir, subfolder, 'checkpoints', "last.ckpt")
+    #             if not os.path.exists(ckpt_path):
+    #                 print(f'ignore no-ckpt runs {subfolder}.')
+    #                 continue # ignore no-ckpt runs
+    #             if cont_num > best_cont:
+    #                 best_cont = cont_num # lastest version
+    #                 opt.resume = os.path.join(opt.logdir, subfolder)
+    
+    # # ---- END auto-detect resume ----
     if opt.resume:
         if not os.path.exists(opt.resume):
             raise ValueError("Cannot find {}".format(opt.resume))
         if os.path.isfile(opt.resume):
             paths = opt.resume.split("/")
-            # idx = len(paths)-paths[::-1].index("logs")+1
-            # logdir = "/".join(paths[:idx])
-            logdir = "/".join(paths[:-2])
+            old_logdir = "/".join(paths[:-2])
             ckpt = opt.resume
         else:
             assert os.path.isdir(opt.resume), opt.resume
-            logdir = opt.resume.rstrip("/")
-            ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
-
-        opt.resume_from_checkpoint = ckpt
-        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
+            old_logdir = opt.resume.rstrip("/")
+            ckpt = os.path.join(old_logdir, "checkpoints", "last.ckpt")
+        
+        if os.path.exists(ckpt): # it is possible the first ckpt is not saved
+            print(f'Found last.ckpt {ckpt}, skip original resume_from_checkpoint {opt.resume_from_checkpoint}.')
+            opt.resume_from_checkpoint = ckpt # no need to load from the original source
+            # change seed to avoid trained batches
+            opt.seed = int(time.time()) % 1000000
+        else:
+            print(f'Resuming from {opt.resume} but no ckpt. Only reuse configs as possible.')
+        base_configs = sorted(glob.glob(os.path.join(old_logdir, "configs/*.yaml")))
         opt.base = base_configs + opt.base
-        _tmp = logdir.split("/")
-        nowname = _tmp[-1]
+        _tmp = old_logdir.split("/")[-1]
+        if _tmp.endswith('continue'):
+            _tmp = '_'.join(_tmp.split('_')[:-1])
+        # nowname = _tmp + '_' + str(best_cont+1) + 'continue'
+        nowname = _tmp
     else:
         if opt.name:
             name = "_" + opt.name
@@ -711,7 +758,11 @@ if __name__ == "__main__":
         else:
             name = ""
         nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
+
+    logdir = os.path.join(opt.logdir, nowname)
+    print(f'Logdir: {logdir}')
+    if not os.path.isdir(logdir):
+        os.makedirs(logdir, exist_ok=True)
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -722,34 +773,43 @@ if __name__ == "__main__":
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+        
+        # add additional params
+        config.model.params.logdir = logdir
+        if opt.num_shards is not None and opt.shard_id is not None:
+            config.model.params.num_shards = opt.num_shards
+            config.model.params.shard_id = opt.shard_id
+            config.data.params.test.params.num_shards = opt.num_shards
+            config.data.params.test.params.shard_id = opt.shard_id
+        
+        # model
+        # resume_from_checkpoint now control this pre-loading,
+        # Trainer resume is not relevant to this arg.
+        if opt.resume_from_checkpoint:
+            model = load_model_from_config(
+                config,
+                opt.resume_from_checkpoint,
+                strict=not opt.ignore_unexpected_keys
+                )
+            opt.resume_from_checkpoint = None
+        else:
+            model = instantiate_from_config(config.model)
+            
+        # lightning & trainer
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
-        trainer_config["accelerator"] = "ddp"
+        trainer_config["accelerator"] = "cuda"
         for k in nondefault_trainer_args(opt):
+            # override default and from config by cli (for direct pass training args instead of .lightning.training)
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["gpus"]
-            print(f"Running on GPUs {gpuinfo}")
-            cpu = False
+            
+        gpuinfo = trainer_config["devices"]
+        print(f"Running on GPUs {gpuinfo}")
+        cpu = False
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
-
-        # tokenizer
-        tokenizer_type = config.get('tokenizer_type', 'roberta-large')
-        get_tokenizer(tokenizer_type)
-
-        # model
-        if opt.resume:
-            config.model.params.ckpt_path = opt.resume_from_checkpoint
-        config.model.params.logdir = logdir
-        config.model.params.num_shards = opt.num_shards
-        config.model.params.shard_id = opt.shard_id
-        model = instantiate_from_config(config.model)
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -761,7 +821,7 @@ if __name__ == "__main__":
                 "params": {
                     "name": nowname,
                     "save_dir": logdir,
-                    "offline": opt.debug,
+                    "offline": True,
                     "id": nowname,
                 }
             },
@@ -779,6 +839,7 @@ if __name__ == "__main__":
         else:
             logger_cfg = OmegaConf.create()
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
+        # TODO how to know the rank?
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
         # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
@@ -790,11 +851,15 @@ if __name__ == "__main__":
                 "filename": "{epoch:06}",
                 "verbose": True,
                 "save_last": True,
+                "every_n_train_steps": 5000,
+                "save_weights_only": True, # NOTE fit(ckpt=...) requires optimizer_states, but lightning is buggy.
+                "save_top_k": 2
             }
         }
-        if hasattr(model, "monitor"):
+        if hasattr(model, "monitor") and model.monitor is not None:
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
+            default_modelckpt_cfg["params"]["mode"] = model.mode if hasattr(model, 'mode') else 'min'
             default_modelckpt_cfg["params"]["save_top_k"] = 3
 
         if "modelcheckpoint" in lightning_config:
@@ -803,8 +868,6 @@ if __name__ == "__main__":
             modelckpt_cfg =  OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
-        if version.parse(pl.__version__) < version.parse('1.4.0'):
-            trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -818,7 +881,6 @@ if __name__ == "__main__":
                     "cfgdir": cfgdir,
                     "config": config,
                     "lightning_config": lightning_config,
-                    "debug": opt.debug,
                 }
             },
             "text_logger": {
@@ -847,59 +909,22 @@ if __name__ == "__main__":
                 "target": "main.CUDACallback"
             },
         }
-        if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
+        assert version.parse(pl.__version__) >= version.parse('1.4.0')
+        default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
 
         if "callbacks" in lightning_config:
             callbacks_cfg = lightning_config.callbacks
         else:
             callbacks_cfg = OmegaConf.create()
-
-        if 'metrics_over_trainsteps_checkpoint' in callbacks_cfg:
-            print(
-                'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
-            default_metrics_over_trainsteps_ckpt_dict = {
-                'metrics_over_trainsteps_checkpoint':
-                    {"target": 'pytorch_lightning.callbacks.ModelCheckpoint',
-                     'params': {
-                         "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
-                         "filename": "{epoch:06}-{step:09}",
-                         "verbose": True,
-                         'save_top_k': -1,
-                         'every_n_train_steps': 10000,
-                         'save_weights_only': True
-                     }
-                     }
-            }
-            default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
-
+        
         callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
-        if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
-            callbacks_cfg.ignore_keys_callback.params['ckpt_path'] = trainer_opt.resume_from_checkpoint
-        elif 'ignore_keys_callback' in callbacks_cfg:
-            del callbacks_cfg['ignore_keys_callback']
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-        if not "plugins" in trainer_kwargs:
-            trainer_kwargs["plugins"] = list()
-        if not lightning_config.get("find_unused_parameters", True):
-            from pytorch_lightning.plugins import DDPPlugin
-            trainer_kwargs["plugins"].append(DDPPlugin(find_unused_parameters=False))
-        if MULTINODE_HACKS:
-            # disable resume from hpc ckpts
-            # NOTE below only works in later versions
-            # from pytorch_lightning.plugins.environments import SLURMEnvironment
-            # trainer_kwargs["plugins"].append(SLURMEnvironment(auto_requeue=False))
-            # hence we monkey patch things
-            from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
-            setattr(CheckpointConnector, "hpc_resume_path", None)
-
+        
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
-
+        
         # data
-        config.data.params.test.params.num_shards = opt.num_shards
-        config.data.params.test.params.shard_id = opt.shard_id
         data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.
@@ -907,16 +932,14 @@ if __name__ == "__main__":
         data.prepare_data()
         data.setup()
         print("#### Data #####")
-        try:
-            for k in data.datasets:
-                print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
-        except:
-            print("datasets not yet initialized.")
-
+        for k in data.datasets:
+            ld = -1 if isinstance(data.datasets[k], torch.utils.data.IterableDataset) else len(data.datasets[k])
+            print(f"{k}, {data.datasets[k].__class__.__name__}, {ld}")
+        
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            ngpu = len(lightning_config.trainer.devices.strip(",").split(','))
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -953,7 +976,7 @@ if __name__ == "__main__":
 
         import signal
 
-        signal.signal(signal.SIGUSR1, melk)
+        # signal.signal(signal.SIGUSR1, melk)
         signal.signal(signal.SIGUSR2, divein)
 
         # run
@@ -961,23 +984,10 @@ if __name__ == "__main__":
             try:
                 trainer.fit(model, data)
             except Exception:
-                if not opt.debug:
-                    melk()
+                melk()
                 raise
         if not opt.no_test and not trainer.interrupted:
             trainer.test(model, data)
-    except RuntimeError as err:
-        if MULTINODE_HACKS:
-            import requests
-            import datetime
-            import os
-            import socket
-            device = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
-            hostname = socket.gethostname()
-            ts = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            # resp = requests.get('http://169.254.169.254/latest/meta-data/instance-id')
-            # print(f'ERROR at {ts} on {hostname}/{resp.text} (CUDA_VISIBLE_DEVICES={device}): {type(err).__name__}: {err}', flush=True)
-        raise err
     except Exception:
         if opt.debug and trainer.global_rank == 0:
             try:

@@ -113,16 +113,16 @@ if __name__ == "__main__":
     
     total_src_lines, total_dst_lines = [], []
     for i in range(num_shards):
-        src = src_prefix + str(i) + "_" + str(num_shards)
-        dst = dst_prefix + str(i) + "_" + str(num_shards)
+        src = src_prefix + "_" + str(i) + "_" + str(num_shards)
+        dst = dst_prefix + "_" + str(i) + "_" + str(num_shards)
         with open(src, 'r') as src_f:
             src_lines = [line.strip() for line in src_f]
         with open(dst, 'r') as dst_f:
             dst_lines = [line.strip() for line in dst_f]
         
         min_len = min(len(src_lines), len(dst_lines))
-        total_src_lines.append(src_lines[:min_len])
-        total_dst_lines.append(dst_lines[:min_len])
+        total_src_lines.extend(src_lines[:min_len])
+        total_dst_lines.extend(dst_lines[:min_len])
     src_lines = total_src_lines
     dst_lines = total_dst_lines
     
@@ -137,6 +137,7 @@ if __name__ == "__main__":
     elif metric == 'bertscore':
         bertscore = evaluate.load('bertscore')
         results = bertscore.compute(predictions=dst_lines, references=src_lines, lang='en')
+        breakpoint()
         # results = bertscore.compute(predictions=dst_lines, references=src_lines, model_type='bert-base-uncased')
     elif metric == 'selfbleu':
         selfbleu = SelfBleu(src, gram=5)

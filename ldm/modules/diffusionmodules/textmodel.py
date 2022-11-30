@@ -1000,7 +1000,8 @@ class TransformerModel(nn.Module):
         cond_config_name=None,
         cond_init_pretrained=False,
         input_projection=False,
-        output_projection=False
+        output_projection=False,
+        softmax=False
     ):
         super().__init__()
         
@@ -1015,6 +1016,7 @@ class TransformerModel(nn.Module):
         self.num_classes = num_classes
         self.input_projection = input_projection
         self.output_projection = output_projection
+        self.softmax = nn.Softmax(dim=-1) if softmax else None
         self.cond = cond
         if cond == 'cross':
             config.is_decoder = True
@@ -1083,12 +1085,11 @@ class TransformerModel(nn.Module):
         emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
         
         if context is not None and self.cond == "cross":
-            context_length = context.shape[1]
-            context_position_ids = self.position_ids[:, :context_length]
-            if self.input_projection:
-                context = self.input_up_proj(context)
-            context = self.position_embeddings(context_position_ids) + context
-            
+            # context_length = context.shape[1]
+            # context_position_ids = self.position_ids[:, :context_length]
+            # if self.input_projection:
+            #     context = self.input_up_proj(context)
+            # context = self.position_embeddings(context_position_ids) + context
             assert len(c_mask.shape) == 2
             
             dtype = next(self.parameters()).dtype
@@ -1102,8 +1103,10 @@ class TransformerModel(nn.Module):
             h = self.input_transformers(emb_inputs).last_hidden_state
         if self.output_projection:
             h = self.output_down_proj(h)
+        if self.softmax is not None:
+            h = self.softmax(h)
         return h.permute(0, 2, 1)
             
-        
+
         
         

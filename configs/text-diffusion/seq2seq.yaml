@@ -2,6 +2,7 @@ model: # add base config
   base_learning_rate: 1.0e-04
   target: ldm.models.diffusion.text_ddpm.TextDiffusion
   params:
+    tokenizer_type: 'roberta-base'
     linear_start: 0.00085
     linear_end: 0.0120
     num_timesteps_cond: 1
@@ -11,7 +12,7 @@ model: # add base config
     cond_stage_key: cond_input_ids
     cond_attention_mask: cond_attention_mask
     text_length: 64
-    channels: 1024
+    channels: 768
     cond_stage_trainable: false
     first_stage_trainable: false
     conditioning_key: crossattn
@@ -37,8 +38,8 @@ model: # add base config
     unet_config:
       target: ldm.modules.diffusionmodules.textmodel.TransformerModel
       params:
-        in_channels: 1024
-        out_channels: 1024
+        in_channels: 768
+        out_channels: 768
         model_channels: 512
         config_name: roberta-base
         cond: cross
@@ -49,30 +50,28 @@ model: # add base config
     first_stage_config:
       target: ldm.models.text_embedder.TextEmbedder
       params:
-        embedding_ckpt_path: /data/qingsong/pretrain/roberta-large/1/mp_rank_00_model_states.pt
+        embedding_ckpt_path: /zhangpai21/workspace/zwd/ckpts/roberta-base/1/mp_rank_00_model_states.pt
         vocab_size: 50265
-        hidden_size: 1024
+        hidden_size: 768
         sample_length: 64
     cond_stage_config: __is_first_stage__
-
-tokenizer_type: 'roberta-base'
 
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 64
+    batch_size: 32
     num_workers: 16
     wrap: false
     train:
       target: ldm.data.textdataset.QQPDataset
       params:
-        path: /data/qingsong/dp/text-diffusion/qqp-dataset/train.csv
+        path: /zhangpai21/workspace/zwd/seq2seq_data/qqp/train.csv
         sample_length: 64
         cond_length: 64
     test:
       target: ldm.data.textdataset.QQPDataset
       params:
-        path: /data/qingsong/dp/text-diffusion/qqp-dataset/train.csv
+        path: /zhangpai21/workspace/zwd/seq2seq_data/qqp/train.csv
         sample_length: 64
         cond_length: 64
 
@@ -86,14 +85,14 @@ lightning:
     text_logger:
       target: main.TextLogger
       params:
-        batch_frequency: 10000
+        batch_frequency: 10
         max_texts: 64
         increase_log_steps: False
         log_first_step: False
         log_texts_kwargs:
           ddim_steps:
           N: 64
-          unconditional_guidance_scale: [1.5, 2, 5, 10, 50]
+          unconditional_guidance_scale: [2]
 
   trainer:
     benchmark: True
