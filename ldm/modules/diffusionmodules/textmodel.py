@@ -979,7 +979,6 @@ def instantiate_model(config_name, config, init_pretrained=False, local_files_on
             return RobertaEncoder(config)
         else:
             raise NotImplementedError
-        
 
 class TransformerModel(nn.Module):
     """
@@ -1100,7 +1099,17 @@ class TransformerModel(nn.Module):
             context = self.encoder(context, attention_mask=extended_c_mask).last_hidden_state
             h = self.input_transformers(emb_inputs, encoder_hidden_states=context, encoder_attention_mask=extended_c_mask).last_hidden_state
         else:
-            h = self.input_transformers(emb_inputs).last_hidden_state
+            attention_mask = None
+            if c_mask is not None:
+                pad_length = seq_length - c_mask.shape[1]
+                c_mask = F.pad(c_mask, (pad_length, 0), "constant", 1)
+                dtype = next(self.parameters()).dtype
+                extended_c_mask = c_mask[:, None, None, :]
+                extended_c_mask = extended_c_mask.to(dtype=dtype)  # fp16 compatibility
+                extended_c_mask = (1.0 - extended_c_mask) * torch.finfo(dtype).min
+                attention_mask = extended_c_mask
+
+            h = self.input_transformers(emb_inputs, attention_mask=attention_mask).last_hidden_state
         if self.output_projection:
             h = self.output_down_proj(h)
         if self.softmax is not None:
